@@ -87,7 +87,7 @@ def main():
 
     if not args.distributed:
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-            model.features = torch.nn.DataParallel(model.features)
+            model.feature = torch.nn.DataParallel(model.feature)
             model.cuda()
         else:
             model = torch.nn.DataParallel(model).cuda()
