@@ -16,20 +16,22 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+from compute_flops import *
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('--dataset', type=str, default='cifar100',
+parser.add_argument('--dataset', type=str, default='cifar10',
                     help='training dataset (default: cifar100)')
 parser.add_argument('-j', '--workers', default=25, type=int, metavar='N',
                     help='number of data loading workers (default: 25)')
-parser.add_argument('--epochs', default=160, type=int, metavar='N',
+parser.add_argument('--epochs', default=80, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=64, type=int,
+parser.add_argument('-b', '--batch-size', default=1, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
@@ -59,12 +61,13 @@ parser.add_argument('--scratch', default='', type=str, metavar='PATH',
                     help='the PATH to the pruned model')
 parser.add_argument('--arch', default='resnet50', type=str,
                     help='architecture to use')
-parser.add_argument('--depth', default=16, type=int,
-                    help='depth of the neural network')
+parser.add_argument('--epoch-step', nargs='+', type=int, default=[30, 60])
 parser.add_argument('--local_rank', type=int, default=0)
 
 best_prec1 = 0
 
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda" if use_cuda else "cpu")
 
 def initialize_weights(module):
     for m in module.modules():
@@ -88,7 +91,9 @@ def main():
     if not os.path.exists(args.save):
         os.makedirs(args.save)
 
-    torch.cuda.set_device(args.local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.local_rank)
+
     print("local_rank:", args.local_rank)
     if args.distributed:
         dist.init_process_group(backend=args.dist_backend)
@@ -103,20 +108,19 @@ def main():
     model.fc = nn.Linear(in_channel, num_classes)
     initialize_weights(model.fc)
 
-    step_size = 60
+    print_model_param_nums(model)
+    print_model_param_flops(model, input_res=224)
+
+    print("epoch_step:", args.epoch_step)
 
     if not args.distributed:
-        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-            model.feature = torch.nn.DataParallel(model.feature)
-            model.cuda()
-        else:
-            model = torch.nn.DataParallel(model).cuda()
+        model = torch.nn.DataParallel(model).to(device)
     else:
-        model.cuda()
+        model.to(device)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -193,7 +197,7 @@ def main():
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, step_size)
+        adjust_learning_rate(optimizer, epoch, args.epoch_step)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch)
@@ -232,10 +236,9 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        input = input.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
-        #input_var = torch.autograd.Variable(input)
-        #target_var = torch.autograd.Variable(target)
+        if use_cuda:
+            input = input.cuda(non_blocking=True)
+            target = target.cuda(non_blocking=True)
 
         # compute output
         output = model(input)
@@ -262,9 +265,10 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t'
+                  'LR {lr:.3f}'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+                   data_time=data_time, loss=losses, top1=top1, top5=top5, lr=args.current_lr))
 
 def validate(val_loader, model, criterion):
     batch_time = AverageMeter()
@@ -278,8 +282,9 @@ def validate(val_loader, model, criterion):
     with torch.no_grad():
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
-            input = input.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
+            if use_cuda:
+                input = input.cuda(non_blocking=True)
+                target = target.cuda(non_blocking=True)
 
             # compute output
             output = model(input)
@@ -331,11 +336,11 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
-def adjust_learning_rate(optimizer, epoch, step_size=30):
+def adjust_learning_rate(optimizer, epoch, epoch_step):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // step_size))
+    args.current_lr = args.lr * (0.1 ** np.sum(epoch >= np.array(epoch_step)))
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group['lr'] = args.current_lr
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
