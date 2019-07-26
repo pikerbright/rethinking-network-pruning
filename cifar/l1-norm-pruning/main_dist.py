@@ -16,8 +16,6 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
-import models
-
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -59,13 +57,27 @@ parser.add_argument('--save', default='.', type=str, metavar='PATH',
                     help='path to save prune model (default: current directory)')
 parser.add_argument('--scratch', default='', type=str, metavar='PATH',
                     help='the PATH to the pruned model')
-parser.add_argument('--arch', default='vgg', type=str,
+parser.add_argument('--arch', default='resnet50', type=str,
                     help='architecture to use')
 parser.add_argument('--depth', default=16, type=int,
                     help='depth of the neural network')
 parser.add_argument('--local_rank', type=int, default=0)
 
 best_prec1 = 0
+
+
+def initialize_weights(module):
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, 0, 0.01)
+            nn.init.constant_(m.bias, 0)
 
 def main():
     global args, best_prec1
@@ -81,7 +93,15 @@ def main():
     if args.distributed:
         dist.init_process_group(backend=args.dist_backend)
 
-    model = models.__dict__[args.arch](dataset=args.dataset, depth=args.depth)
+    model = getattr(models, args.arch)(pretrained=True)
+    in_channel = model.fc.in_features
+    num_classes = model.fc.out_features
+    if args.dataset == 'cifar10':
+        num_classes = 10
+    elif args.dataset == 'cifar100':
+        num_classes = 100
+    model.fc = nn.Linear(in_channel, num_classes)
+    initialize_weights(model.fc)
 
     step_size = 60
 
