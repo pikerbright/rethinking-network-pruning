@@ -16,14 +16,15 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+import models
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
+parser.add_argument('--dataset', type=str, default='cifar100',
+                    help='training dataset (default: cifar100)')
 parser.add_argument('-j', '--workers', default=25, type=int, metavar='N',
                     help='number of data loading workers (default: 25)')
 parser.add_argument('--epochs', default=160, type=int, metavar='N',
@@ -75,8 +76,10 @@ def main():
     if not os.path.exists(args.save):
         os.makedirs(args.save)
 
+    torch.cuda.set_device(args.local_rank)
+    print("local_rank:", args.local_rank)
     if args.distributed:
-        dist.init_process_group(backend=args.dist_backend, init_method='env://', rank=args.rank)
+        dist.init_process_group(backend=args.dist_backend)
 
     model = models.__dict__[args.arch](dataset=args.dataset, depth=args.depth)
 
@@ -90,7 +93,7 @@ def main():
             model = torch.nn.DataParallel(model).cuda()
     else:
         model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
@@ -144,6 +147,9 @@ def main():
             ]))
 
     if args.distributed:
+        print("world_size:", dist.get_world_size())
+        print("local_rank:", dist.get_rank())
+        #train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, args.world_size, args.local_rank)
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
         train_sampler = None
@@ -153,7 +159,7 @@ def main():
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
         validate(test_loader, model, criterion)
@@ -171,7 +177,7 @@ def main():
 
         # evaluate on validation set
         prec1 = validate(test_loader, model, criterion)
-        history_score[epoch] = prec1
+        history_score[epoch] = prec1.cpu().data.numpy()
         np.savetxt(os.path.join(args.save, 'record.txt'), history_score, fmt = '%10.5f', delimiter=',')
 
         # remember best prec@1 and save checkpoint
@@ -203,13 +209,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input)
-        target_var = torch.autograd.Variable(target)
+        input = input.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+        #input_var = torch.autograd.Variable(input)
+        #target_var = torch.autograd.Variable(target)
 
         # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        output = model(input)
+        loss = criterion(output, target)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
@@ -247,13 +254,12 @@ def validate(val_loader, model, criterion):
 
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+        input = input.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
 
         # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        output = model(input)
+        loss = criterion(output, target)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
